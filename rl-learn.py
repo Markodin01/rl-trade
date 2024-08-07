@@ -12,6 +12,7 @@ import os
 from tqdm import tqdm
 import time
 import functools
+import matplotlib.pyplot as plt
 
 # Set up logging
 log_dir = "training_logs"
@@ -51,6 +52,8 @@ class CryptoTradingEnv(gym.Env):
         self.action_space = spaces.Discrete(22)  # This will be dynamically adjusted
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
         self.hold_count = 0
+        self.transaction_count = 0
+        self.positive_trades = 0
         self.reset()
 
     @timer
@@ -61,6 +64,8 @@ class CryptoTradingEnv(gym.Env):
         self.done = False
         self.hold_count = 0
         self.last_portfolio_value = self.initial_balance
+        self.transaction_count = 0
+        self.positive_trades = 0
         self._update_action_space()
         return self._next_observation()
 
@@ -88,13 +93,12 @@ class CryptoTradingEnv(gym.Env):
         self.action_space = spaces.Discrete(len(self.valid_actions))
 
     @timer
-    def step(self, action_idx):
+    def step(self, action):
         self.current_step += 1
         
         if self.current_step >= len(self.df) - 1:
             self.done = True
 
-        action = self.valid_actions[action_idx]
         current_price = self.df[self.current_step, 4]  # close price
         
         # Calculate portfolio value before action
@@ -107,6 +111,7 @@ class CryptoTradingEnv(gym.Env):
             self.balance -= (buy_amount + fee)
             self.btc_held += buy_units
             self.hold_count = 0
+            self.transaction_count += 1
         elif action < 11:  # Sell action
             sell_units = action + 1
             sell_amount = sell_units * current_price
@@ -114,6 +119,7 @@ class CryptoTradingEnv(gym.Env):
             self.balance += (sell_amount - fee)
             self.btc_held -= sell_units
             self.hold_count = 0
+            self.transaction_count += 1
         else:  # Hold action
             self.hold_count += 1
 
@@ -125,6 +131,9 @@ class CryptoTradingEnv(gym.Env):
         hold_penalty = -0.0001 * self.hold_count  # Small penalty for holding, increases with consecutive holds
         
         reward = action_reward + hold_penalty
+
+        if action != 11 and portfolio_value_after > portfolio_value_before:
+            self.positive_trades += 1
 
         # Check end game conditions
         portfolio_return = (portfolio_value_after / self.initial_balance) - 1
@@ -148,11 +157,13 @@ class CryptoTradingEnv(gym.Env):
             "portfolio_value": portfolio_value_after, 
             "portfolio_return": portfolio_return,
             "action": "Buy" if action > 11 else ("Sell" if action < 11 else "Hold"),
-            "units": abs(action - 11) if action != 11 else 0
+            "units": abs(action - 11) if action != 11 else 0,
+            "transaction_count": self.transaction_count,
+            "positive_trades": self.positive_trades
         }
 
 class DQNAgent:
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size=22):
         self.state_size = state_size
         self.action_size = action_size
         self.memory = deque(maxlen=2000)
@@ -183,11 +194,12 @@ class DQNAgent:
         self.memory.append((state, action, reward, next_state, done))
 
     @timer
-    def act(self, state):
+    def act(self, state, valid_actions):
         if np.random.rand() <= self.epsilon:
-            return random.randrange(self.action_size)
+            return random.choice(valid_actions)
         act_values = self.model.predict(state, verbose=0)
-        return np.argmax(act_values[0])
+        valid_act_values = act_values[0][valid_actions]
+        return valid_actions[np.argmax(valid_act_values)]
 
     @timer
     def replay(self, batch_size):
@@ -215,7 +227,7 @@ class DQNAgent:
         self.model.load_weights(name)
 
     def save(self, name):
-        self.model.save(name)  # Change this line to save the entire model, not just weights
+        self.model.save(name)
 
 @timer
 def fetch_and_preprocess_data(exchange_id, symbol, timeframe='1h', limit=1000):
@@ -243,11 +255,69 @@ def fetch_and_preprocess_data(exchange_id, symbol, timeframe='1h', limit=1000):
         logger.error(f"Error in fetch_and_preprocess_data: {str(e)}")
         raise
 
+def plot_net_balance_change(performance_history):
+    episodes = len(performance_history)
+    final_values = [episode[-1] for episode in performance_history]
+    net_changes = [value - 10000 for value in final_values]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, episodes + 1), net_changes, marker='o')
+    plt.xlabel('Episode')
+    plt.ylabel('Net Balance Change ($)')
+    plt.title('Net Balance Change Over Simulation')
+    plt.grid(True)
+    plt.savefig('net_balance_change.png')
+    plt.close()
+
+def plot_percent_balance_change(performance_history):
+    episodes = len(performance_history)
+    final_values = [episode[-1] for episode in performance_history]
+    percent_changes = [((value - 10000) / 10000) * 100 for value in final_values]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, episodes + 1), percent_changes, marker='o')
+    plt.xlabel('Episode')
+    plt.ylabel('Percent Balance Change (%)')
+    plt.title('Percent Balance Change Over Simulation')
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.grid(True)
+    plt.savefig('percent_balance_change.png')
+    plt.close()
+
+def plot_successful_trades_percentage(successful_trades_history):
+    episodes = len(successful_trades_history)
+    successful_percentages = [trades[0] / trades[1] * 100 if trades[1] > 0 else 0 for trades in successful_trades_history]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, episodes + 1), successful_percentages, marker='o')
+    plt.xlabel('Episode')
+    plt.ylabel('Successful Trades (%)')
+    plt.title('Percentage of Successful Trades Over Simulation')
+    plt.ylim(0, 100)
+    plt.grid(True)
+    plt.savefig('successful_trades_percentage.png')
+    plt.close()
+
+def plot_transaction_count(transaction_count_history):
+    episodes = len(transaction_count_history)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, episodes + 1), transaction_count_history, marker='o')
+    plt.xlabel('Episode')
+    plt.ylabel('Number of Transactions')
+    plt.title('Number of Transactions Over Simulation')
+    plt.grid(True)
+    plt.savefig('transaction_count.png')
+    plt.close()
+    
 @timer
 def train_agent(env, agent, episodes, batch_size, debug=False):
     total_start_time = time.time()
     total_steps = 0
     step_times = []
+    performance_history = []
+    successful_trades_history = []
+    transaction_count_history = []
     
     for e in tqdm(range(episodes), desc="Training Progress"):
         episode_start_time = time.time()
@@ -255,15 +325,16 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
         state = np.reshape(state, [1, 7])
         total_reward = 0
         step_count = 0
+        episode_performance = [env.initial_balance]
         
         done = False
         while not done:
             step_start_time = time.time()
             
-            action_idx = agent.act(state)
-            next_state, reward, done, info = env.step(action_idx)
+            action = agent.act(state, env.valid_actions)
+            next_state, reward, done, info = env.step(action)
             next_state = np.reshape(next_state, [1, 7])
-            agent.remember(state, action_idx, reward, next_state, done)
+            agent.remember(state, action, reward, next_state, done)
             
             step_end_time = time.time()
             step_times.append(step_end_time - step_start_time)
@@ -278,6 +349,7 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
             state = next_state
             total_reward += reward
             step_count += 1
+            episode_performance.append(info['portfolio_value'])
             
             if len(agent.memory) > batch_size:
                 agent.replay(batch_size)
@@ -291,9 +363,13 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
         logger.info(f"  Final Portfolio Value: ${info['portfolio_value']:.2f}, Return: {info['portfolio_return']:.2%}")
         logger.info(f"  Time: {episode_time:.2f} seconds")
         
-        if (e + 1) % 10 == 0:
-            agent.save(f'crypto_trading_model_episode_{e+1}.h5')
-            logger.info(f"Model saved at episode {e+1}")
+        performance_history.append(episode_performance)
+        successful_trades_history.append((info['positive_trades'], info['transaction_count']))
+        transaction_count_history.append(info['transaction_count'])
+        
+        # if (e + 1) % 10 == 0:
+        #     agent.save(f'crypto_trading_model_episode_{e+1}.h5')
+        #     logger.info(f"Model saved at episode {e+1}")
     
     total_time = time.time() - total_start_time
     logger.info(f"Total training time: {total_time:.2f} seconds")
@@ -302,6 +378,13 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
     logger.info(f"Average steps per episode: {total_steps/episodes:.2f}")
     logger.info(f"Average time per step: {np.mean(step_times):.6f} seconds")
 
+    # Plot performance metrics
+    plot_net_balance_change(performance_history)
+    plot_percent_balance_change(performance_history)
+    plot_successful_trades_percentage(successful_trades_history)
+    plot_transaction_count(transaction_count_history)
+
+# Update in the main execution block:
 if __name__ == "__main__":
     try:
         exchange_id = 'binance'
@@ -311,7 +394,7 @@ if __name__ == "__main__":
 
         env = CryptoTradingEnv(df)
         state_size = env.observation_space.shape[0]
-        action_size = env.action_space.n
+        action_size = 22  # Fixed to maximum possible actions
         agent = DQNAgent(state_size, action_size)
         logger.info(f"Initialized environment and agent. State size: {state_size}, Action size: {action_size}")
 
