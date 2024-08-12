@@ -13,6 +13,7 @@ from tqdm import tqdm
 import time
 import functools
 import matplotlib.pyplot as plt
+import warnings
 
 # Set up logging
 log_dir = "training_logs"
@@ -23,7 +24,7 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_filename = f"{log_dir}/training_log_{timestamp}.log"
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # Changed from DEBUG to INFO
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_filename),
@@ -31,6 +32,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger()
+
+# Filter out matplotlib font warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 def timer(func):
     @functools.wraps(func)
@@ -56,7 +60,7 @@ class CryptoTradingEnv(gym.Env):
         self.positive_trades = 0
         self.reset()
 
-    @timer
+     
     def reset(self):
         self.balance = self.initial_balance
         self.btc_held = 0
@@ -69,7 +73,7 @@ class CryptoTradingEnv(gym.Env):
         self._update_action_space()
         return self._next_observation()
 
-    @timer
+     
     def _next_observation(self):
         return np.array([
             self.balance,
@@ -92,7 +96,7 @@ class CryptoTradingEnv(gym.Env):
         
         self.action_space = spaces.Discrete(len(self.valid_actions))
 
-    @timer
+     
     def step(self, action):
         self.current_step += 1
         
@@ -126,11 +130,12 @@ class CryptoTradingEnv(gym.Env):
         # Calculate portfolio value after action
         portfolio_value_after = self.balance + self.btc_held * current_price
         
-        # Calculate reward
+        # Calculate normalized reward
         action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
-        hold_penalty = -0.0001 * self.hold_count  # Small penalty for holding, increases with consecutive holds
+        hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
         
-        reward = action_reward + hold_penalty
+        # Normalize reward to be between -1 and 1
+        reward = np.clip(action_reward + hold_penalty, -1, 1)
 
         if action != 11 and portfolio_value_after > portfolio_value_before:
             self.positive_trades += 1
@@ -140,10 +145,10 @@ class CryptoTradingEnv(gym.Env):
 
         if portfolio_return <= -0.1:  # Lost 10% or more
             self.done = True
-            reward -= 1  # Additional penalty for significant loss
+            reward = -10  # Significant penalty for major loss
         elif portfolio_return >= 0.2:  # Gained 20% or more
             self.done = True
-            reward += 1  # Additional reward for significant gain
+            reward = 10  # Significant reward for major gain
 
         if self.done:
             logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
@@ -193,7 +198,7 @@ class DQNAgent:
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
 
-    @timer
+     
     def act(self, state, valid_actions):
         if np.random.rand() <= self.epsilon:
             return random.choice(valid_actions)
@@ -201,7 +206,7 @@ class DQNAgent:
         valid_act_values = act_values[0][valid_actions]
         return valid_actions[np.argmax(valid_act_values)]
 
-    @timer
+     
     def replay(self, batch_size):
         minibatch = random.sample(self.memory, batch_size)
         states = np.array([i[0] for i in minibatch]).reshape(batch_size, self.state_size)
@@ -229,7 +234,7 @@ class DQNAgent:
     def save(self, name):
         self.model.save(name)
 
-@timer
+ 
 def fetch_and_preprocess_data(exchange_id, symbol, timeframe='1h', limit=1000):
     try:
         logger.info(f"Fetching data from {exchange_id} for {symbol}...")
@@ -255,6 +260,12 @@ def fetch_and_preprocess_data(exchange_id, symbol, timeframe='1h', limit=1000):
         logger.error(f"Error in fetch_and_preprocess_data: {str(e)}")
         raise
 
+def get_timestamped_dir():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    img_dir = f"imgs/{timestamp}"
+    os.makedirs(img_dir, exist_ok=True)
+    return img_dir
+
 def plot_net_balance_change(performance_history):
     episodes = len(performance_history)
     final_values = [episode[-1] for episode in performance_history]
@@ -266,7 +277,9 @@ def plot_net_balance_change(performance_history):
     plt.ylabel('Net Balance Change ($)')
     plt.title('Net Balance Change Over Simulation')
     plt.grid(True)
-    plt.savefig('net_balance_change.png')
+    
+    img_dir = get_timestamped_dir()
+    plt.savefig(f'{img_dir}/net_balance_change.png')
     plt.close()
 
 def plot_percent_balance_change(performance_history):
@@ -281,7 +294,9 @@ def plot_percent_balance_change(performance_history):
     plt.title('Percent Balance Change Over Simulation')
     plt.axhline(y=0, color='r', linestyle='--')
     plt.grid(True)
-    plt.savefig('percent_balance_change.png')
+    
+    img_dir = get_timestamped_dir()
+    plt.savefig(f'{img_dir}/percent_balance_change.png')
     plt.close()
 
 def plot_successful_trades_percentage(successful_trades_history):
@@ -295,7 +310,9 @@ def plot_successful_trades_percentage(successful_trades_history):
     plt.title('Percentage of Successful Trades Over Simulation')
     plt.ylim(0, 100)
     plt.grid(True)
-    plt.savefig('successful_trades_percentage.png')
+    
+    img_dir = get_timestamped_dir()
+    plt.savefig(f'{img_dir}/successful_trades_percentage.png')
     plt.close()
 
 def plot_transaction_count(transaction_count_history):
@@ -307,10 +324,12 @@ def plot_transaction_count(transaction_count_history):
     plt.ylabel('Number of Transactions')
     plt.title('Number of Transactions Over Simulation')
     plt.grid(True)
-    plt.savefig('transaction_count.png')
+    
+    img_dir = get_timestamped_dir()
+    plt.savefig(f'{img_dir}/transaction_count.png')
     plt.close()
     
-@timer
+ 
 def train_agent(env, agent, episodes, batch_size, debug=False):
     total_start_time = time.time()
     total_steps = 0
@@ -390,7 +409,6 @@ if __name__ == "__main__":
         exchange_id = 'binance'
         symbol = 'BTC/USDT'
         df = fetch_and_preprocess_data(exchange_id, symbol)
-        logger.info(f"Data fetching and preprocessing completed. Dataset shape: {df.shape}")
 
         env = CryptoTradingEnv(df)
         state_size = env.observation_space.shape[0]
@@ -402,11 +420,11 @@ if __name__ == "__main__":
         batch_size = 32
 
         logger.info("Starting training...")
-        train_agent(env, agent, episodes, batch_size, debug=True)
+        train_agent(env, agent, episodes, batch_size, debug=False)  # Changed debug to False
         logger.info("Training completed.")
 
-        agent.save('final_crypto_trading_model.h5')
-        logger.info("Final model saved as 'final_crypto_trading_model.h5'")
+        # agent.save('final_crypto_trading_model.h5')
+        # logger.info("Final model saved as 'final_crypto_trading_model.h5'")
     except Exception as e:
         logger.error(f"An error occurred during execution: {str(e)}")
         raise  # Re-raise the exception to see the full traceback
