@@ -15,6 +15,18 @@ import functools
 import matplotlib.pyplot as plt
 import warnings
 
+from enum import IntEnum
+
+class Columns(IntEnum):
+    OPEN = 0
+    HIGH = 1
+    LOW = 2
+    CLOSE = 3
+    VOLUME = 4
+    PRICE_CHANGE_1M = 5
+    PRICE_CHANGE_5M = 6
+    VOLATILITY = 7
+
 # Set up logging
 log_dir = "training_logs"
 if not os.path.exists(log_dir):
@@ -54,7 +66,7 @@ class CryptoTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.transaction_fee_percent = transaction_fee_percent
         self.action_space = spaces.Discrete(22)  # This will be dynamically adjusted
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
         self.hold_count = 0
         self.transaction_count = 0
         self.positive_trades = 0
@@ -75,15 +87,12 @@ class CryptoTradingEnv(gym.Env):
 
      
     def _next_observation(self):
-        return np.array([
-            self.balance,
-            self.btc_held,
-            self.df[self.current_step, 4],  # close price
-            self.df[self.current_step, 5],  # price_change_1m
-            self.df[self.current_step, 6],  # price_change_5m
-            self.df[self.current_step, 5],  # volume
-            self.df[self.current_step, 7],  # volatility
-        ], dtype=np.float32)
+        obs = np.array([
+            self.balance / self.initial_balance,
+            self.btc_held * self.df[self.current_step, Columns.CLOSE] / self.initial_balance,
+            self.df[self.current_step, Columns.CLOSE] / self.df[max(0, self.current_step-10), Columns.CLOSE] - 1,
+        ] + list(self.df[self.current_step]))
+        return obs
 
     def _update_action_space(self):
         current_price = self.df[self.current_step, 4]
@@ -103,25 +112,25 @@ class CryptoTradingEnv(gym.Env):
         if self.current_step >= len(self.df) - 1:
             self.done = True
 
-        current_price = self.df[self.current_step, 4]  # close price
+        current_price = self.df[self.current_step, Columns.CLOSE]
         
         # Calculate portfolio value before action
         portfolio_value_before = self.balance + self.btc_held * current_price
 
         if action > 11:  # Buy action
             buy_units = action - 11
-            buy_amount = buy_units * current_price
+            buy_amount = buy_units / 1000 * current_price
             fee = buy_amount * (self.transaction_fee_percent / 100)
             self.balance -= (buy_amount + fee)
-            self.btc_held += buy_units
+            self.btc_held += buy_units / 1000
             self.hold_count = 0
             self.transaction_count += 1
         elif action < 11:  # Sell action
             sell_units = action + 1
-            sell_amount = sell_units * current_price
+            sell_amount = sell_units / 1000 * current_price
             fee = sell_amount * (self.transaction_fee_percent / 100)
             self.balance += (sell_amount - fee)
-            self.btc_held -= sell_units
+            self.btc_held -= sell_units / 1000
             self.hold_count = 0
             self.transaction_count += 1
         else:  # Hold action
@@ -183,10 +192,10 @@ class DQNAgent:
 
     def _build_model(self):
         model = tf.keras.models.Sequential([
-            tf.keras.layers.Dense(64, activation='relu', input_shape=(self.state_size,)),
-            tf.keras.layers.Dropout(0.2),
-            tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(128, activation='relu', input_shape=(self.state_size,)),
+            tf.keras.layers.Dropout(0.1),
+            tf.keras.layers.Dense(128, activation='relu'),
+            tf.keras.layers.Dropout(0.1),
             tf.keras.layers.Dense(self.action_size, activation='linear')
         ])
         model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate))
@@ -341,7 +350,7 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
     for e in tqdm(range(episodes), desc="Training Progress"):
         episode_start_time = time.time()
         state = env.reset()
-        state = np.reshape(state, [1, 7])
+        state = np.reshape(state, [1, agent.state_size])
         total_reward = 0
         step_count = 0
         episode_performance = [env.initial_balance]
@@ -352,7 +361,7 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
             
             action = agent.act(state, env.valid_actions)
             next_state, reward, done, info = env.step(action)
-            next_state = np.reshape(next_state, [1, 7])
+            next_state = np.reshape(next_state, [1, agent.state_size])
             agent.remember(state, action, reward, next_state, done)
             
             step_end_time = time.time()
