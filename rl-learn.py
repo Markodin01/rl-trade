@@ -5,7 +5,7 @@ import pandas as pd
 import tensorflow as tf
 from collections import deque
 import random
-import ccxt
+from sklearn.preprocessing import StandardScaler
 import logging
 from datetime import datetime
 import os
@@ -66,7 +66,7 @@ class CryptoTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.transaction_fee_percent = transaction_fee_percent
         self.action_space = spaces.Discrete(22)  # This will be dynamically adjusted
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(df.columns),), dtype=np.float32)
         self.hold_count = 0
         self.transaction_count = 0
         self.positive_trades = 0
@@ -244,27 +244,40 @@ class DQNAgent:
         self.model.save(name)
 
  
-def fetch_and_preprocess_data(exchange_id, symbol, timeframe='1h', limit=1000):
+def fetch_and_preprocess_data(csv_file_path, window_size=10):
     try:
-        logger.info(f"Fetching data from {exchange_id} for {symbol}...")
-        exchange = getattr(ccxt, exchange_id)()
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        logger.info(f"Data fetched successfully. Processing {len(ohlcv)} data points...")
-        
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        df['price_change_1m'] = df['close'].pct_change()
-        df['price_change_5m'] = df['close'].pct_change(periods=5)
-        df['volatility'] = df['close'].rolling(window=20).std()
-        df = df.dropna()
-        
-        if df.empty:
+        logger.info(f"Loading data from {csv_file_path}...")
+        df = pd.read_csv(csv_file_path, index_col='timestamp', parse_dates=True)
+        logger.info(f"Data loaded successfully. Processing {len(df)} data points...")
+
+        # Ensure the data is sorted by timestamp
+        df = df.sort_index()
+
+        # Separate features and target
+        features = df.drop(columns=['next_return'])
+        target = df['next_return']
+
+        # Normalize features
+        scaler = StandardScaler()
+        normalized_features = pd.DataFrame(scaler.fit_transform(features), columns=features.columns, index=features.index)
+
+        # Combine normalized features and target
+        df_normalized = pd.concat([normalized_features, target], axis=1)
+
+        # Create lagged features
+        for col in normalized_features.columns:
+            for i in range(1, window_size):
+                df_normalized[f'{col}_lag_{i}'] = df_normalized[col].shift(i)
+
+        # Drop rows with NaN values resulting from lag creation
+        df_normalized = df_normalized.dropna()
+
+        if df_normalized.empty:
             raise ValueError("DataFrame is empty after preprocessing")
-        
-        logger.info(f"Data processing complete. Final dataset contains {len(df)} rows.")
-        return df
+
+        logger.info(f"Data processing complete. Final dataset contains {len(df_normalized)} rows.")
+        return df_normalized
+
     except Exception as e:
         logger.error(f"Error in fetch_and_preprocess_data: {str(e)}")
         raise
@@ -417,7 +430,9 @@ if __name__ == "__main__":
     try:
         exchange_id = 'binance'
         symbol = 'BTC/USDT'
-        df = fetch_and_preprocess_data(exchange_id, symbol)
+        csv_file_path = 'selected_features.csv'
+        window_size = 10  # or whatever window size you prefer
+        df = fetch_and_preprocess_data(csv_file_path, window_size)
 
         env = CryptoTradingEnv(df)
         state_size = env.observation_space.shape[0]
