@@ -97,6 +97,37 @@ class CryptoTradingEnv(gym.Env):
         self.returns = []
         self.sharpe_ratio = 0
         self.max_drawdown = 0
+        
+    def _calculate_sharpe_ratio(self):
+        if len(self.returns) < 2:
+            return 0
+        
+        # Calculate the average return
+        avg_return = np.mean(self.returns)
+        
+        # Calculate the standard deviation of returns
+        std_return = np.std(self.returns)
+        
+        # Assuming risk-free rate is 0 for simplicity
+        # Annualize the Sharpe ratio (assuming daily returns)
+        sharpe_ratio = (avg_return / std_return) * np.sqrt(252)
+        
+        return sharpe_ratio
+    
+    def _calculate_max_drawdown(self):
+        # Calculate cumulative returns
+        cumulative_returns = np.cumprod(1 + np.array(self.returns))
+        
+        # Calculate the running maximum
+        running_max = np.maximum.accumulate(cumulative_returns)
+        
+        # Calculate the percentage drawdown
+        drawdown = (running_max - cumulative_returns) / running_max
+        
+        # Get the maximum drawdown
+        max_drawdown = np.max(drawdown)
+        
+        return max_drawdown
 
      
     def reset(self):
@@ -147,7 +178,7 @@ class CryptoTradingEnv(gym.Env):
         return np.concatenate([obs, additional_state])
 
     def _update_action_space(self):
-        current_price = self.df[self.current_step, 4]
+        current_price = self.df['close'].iloc[self.current_step]
         max_buy_units = min(10, int(self.balance // current_price))
         max_sell_units = min(10, int(self.btc_held))
         
@@ -158,99 +189,99 @@ class CryptoTradingEnv(gym.Env):
         self.action_space = spaces.Discrete(len(self.valid_actions))
 
      
-def step(self, action):
-    self.current_step += 1
-    
-    if self.current_step >= len(self.df):
-        self.done = True
-        return self._next_observation(), 0, self.done, {}
+    def step(self, action):
+        self.current_step += 1
+        
+        if self.current_step >= len(self.df):
+            self.done = True
+            return self._next_observation(), 0, self.done, {}
 
-    current_price = self.df.iloc[self.current_step]['close']
-    
-    # Calculate portfolio value before action
-    portfolio_value_before = self.balance + self.btc_held * current_price
+        current_price = self.df.iloc[self.current_step]['close']
+        
+        # Calculate portfolio value before action
+        portfolio_value_before = self.balance + self.btc_held * current_price
 
-    if action > 11:  # Buy action
-        buy_units = action - 11
-        buy_amount = buy_units / 1000 * current_price
-        fee = buy_amount * (self.transaction_fee_percent / 100)
-        if self.balance >= (buy_amount + fee):
-            self.balance -= (buy_amount + fee)
-            self.btc_held += buy_units / 1000
-            self.hold_count = 0
-            self.transaction_count += 1
-            self.last_action = 'buy'
-            self.last_trade_price = current_price
-            self.position_open_time = self.current_step
-    elif action < 11:  # Sell action
-        sell_units = action + 1
-        sell_amount = (sell_units / 1000) * current_price
-        if self.btc_held >= (sell_units / 1000):
-            fee = sell_amount * (self.transaction_fee_percent / 100)
-            self.balance += (sell_amount - fee)
-            self.btc_held -= sell_units / 1000
-            self.hold_count = 0
-            self.transaction_count += 1
-            self.last_action = 'sell'
-            if self.last_trade_price and current_price > self.last_trade_price:
-                self.positive_trades += 1
-            self.total_profit += sell_amount - fee - (self.last_trade_price * (sell_units / 1000) if self.last_trade_price else 0)
-    else:  # Hold action
-        self.hold_count += 1
-        self.last_action = 'hold'
+        if action > 11:  # Buy action
+            buy_units = action - 11
+            buy_amount = buy_units / 1000 * current_price
+            fee = buy_amount * (self.transaction_fee_percent / 100)
+            if self.balance >= (buy_amount + fee):
+                self.balance -= (buy_amount + fee)
+                self.btc_held += buy_units / 1000
+                self.hold_count = 0
+                self.transaction_count += 1
+                self.last_action = 'buy'
+                self.last_trade_price = current_price
+                self.position_open_time = self.current_step
+        elif action < 11:  # Sell action
+            sell_units = action + 1
+            sell_amount = (sell_units / 1000) * current_price
+            if self.btc_held >= (sell_units / 1000):
+                fee = sell_amount * (self.transaction_fee_percent / 100)
+                self.balance += (sell_amount - fee)
+                self.btc_held -= sell_units / 1000
+                self.hold_count = 0
+                self.transaction_count += 1
+                self.last_action = 'sell'
+                if self.last_trade_price and current_price > self.last_trade_price:
+                    self.positive_trades += 1
+                self.total_profit += sell_amount - fee - (self.last_trade_price * (sell_units / 1000) if self.last_trade_price else 0)
+        else:  # Hold action
+            self.hold_count += 1
+            self.last_action = 'hold'
 
-    # Calculate portfolio value after action
-    portfolio_value_after = self.balance + self.btc_held * current_price
-    
-    # Update max and min portfolio values
-    self.max_portfolio_value = max(self.max_portfolio_value, portfolio_value_after)
-    self.min_portfolio_value = min(self.min_portfolio_value, portfolio_value_after)
-    
-    # Calculate reward
-    action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
-    hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
-    reward = np.clip(action_reward + hold_penalty, -1, 1)
+        # Calculate portfolio value after action
+        portfolio_value_after = self.balance + self.btc_held * current_price
+        
+        # Update max and min portfolio values
+        self.max_portfolio_value = max(self.max_portfolio_value, portfolio_value_after)
+        self.min_portfolio_value = min(self.min_portfolio_value, portfolio_value_after)
+        
+        # Calculate reward
+        action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
+        hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
+        reward = np.clip(action_reward + hold_penalty, -1, 1)
 
-    # Update returns for performance metrics
-    self.returns.append(reward)
-    
-    # Update market trend and volatility
-    self.market_trend = np.sign(self.df.iloc[self.current_step]['close'] - self.df.iloc[self.current_step-1]['close'])
-    self.volatility = self.df.iloc[self.current_step]['volatility'] if 'volatility' in self.df.columns else 0
+        # Update returns for performance metrics
+        self.returns.append(reward)
+        
+        # Update market trend and volatility
+        self.market_trend = np.sign(self.df.iloc[self.current_step]['close'] - self.df.iloc[self.current_step-1]['close'])
+        self.volatility = self.df.iloc[self.current_step]['volatility'] if 'volatility' in self.df.columns else 0
 
-    # Check end game conditions
-    portfolio_return = (portfolio_value_after / self.initial_balance) - 1
+        # Check end game conditions
+        portfolio_return = (portfolio_value_after / self.initial_balance) - 1
 
-    if portfolio_return <= -0.1:  # Lost 10% or more
-        self.done = True
-        reward = -10  # Significant penalty for major loss
-    elif portfolio_return >= 0.2:  # Gained 20% or more
-        self.done = True
-        reward = 10  # Significant reward for major gain
+        if portfolio_return <= -0.1:  # Lost 10% or more
+            self.done = True
+            reward = -10  # Significant penalty for major loss
+        elif portfolio_return >= 0.2:  # Gained 20% or more
+            self.done = True
+            reward = 10  # Significant reward for major gain
 
-    if self.done:
-        logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
+        if self.done:
+            logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
 
-    self.last_portfolio_value = portfolio_value_after
+        self.last_portfolio_value = portfolio_value_after
 
-    # Calculate performance metrics
-    self.sharpe_ratio = self._calculate_sharpe_ratio()
-    self.max_drawdown = self._calculate_max_drawdown()
+        # Calculate performance metrics
+        self.sharpe_ratio = self._calculate_sharpe_ratio()
+        self.max_drawdown = self._calculate_max_drawdown()
 
-    self._update_action_space()
+        self._update_action_space()
 
-    return self._next_observation(), reward, self.done, {
-        "portfolio_value": portfolio_value_after, 
-        "portfolio_return": portfolio_return,
-        "action": self.last_action,
-        "units": abs(action - 11) if action != 11 else 0,
-        "btc_held": self.btc_held,
-        "balance": self.balance,
-        "transaction_count": self.transaction_count,
-        "positive_trades": self.positive_trades,
-        "sharpe_ratio": self.sharpe_ratio,
-        "max_drawdown": self.max_drawdown
-    }
+        return self._next_observation(), reward, self.done, {
+            "portfolio_value": portfolio_value_after, 
+            "portfolio_return": portfolio_return,
+            "action": self.last_action,
+            "units": abs(action - 11) if action != 11 else 0,
+            "btc_held": self.btc_held,
+            "balance": self.balance,
+            "transaction_count": self.transaction_count,
+            "positive_trades": self.positive_trades,
+            "sharpe_ratio": self.sharpe_ratio,
+            "max_drawdown": self.max_drawdown
+        }
 
 class DQNAgent:
     def __init__(self, state_size, action_size=22):
