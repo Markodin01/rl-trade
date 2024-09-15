@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import time
+from datetime import datetime
 
 def timeit(func):
     def wrapper(*args, **kwargs):
@@ -24,13 +25,27 @@ def load_data():
         df_list.append(df)
     return pd.concat(df_list, ignore_index=True)
 
+from datetime import datetime
+
 @timeit
 def preprocess_data(df):
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ns')
+    # Convert timestamp from seconds to datetime string
+    df['timestamp'] = df['timestamp'].apply(lambda ts: datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'))
+    
+    # Convert the string back to datetime and set as index
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
     df.sort_index(inplace=True)
-    df['next_return'] = df['close'].pct_change().shift(-1)
+    
+    # Drop the __index_level_0__ column if it exists
+    df = df.drop(columns=['__index_level_0__'], errors='ignore')
+    
+    # Calculate 'next_return' if it doesn't exist
+    if 'next_return' not in df.columns:
+        df['next_return'] = df['close'].pct_change().shift(-1)
+    
     df.dropna(inplace=True)
+    
     return df
 
 @timeit

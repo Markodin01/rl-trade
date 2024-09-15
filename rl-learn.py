@@ -62,15 +62,41 @@ def timer(func):
 class CryptoTradingEnv(gym.Env):
     def __init__(self, df, initial_balance=10000, transaction_fee_percent=0.1):
         super(CryptoTradingEnv, self).__init__()
-        self.df = df.to_numpy()
+        self.df = df  # Keep as DataFrame instead of converting to numpy
         self.initial_balance = initial_balance
         self.transaction_fee_percent = transaction_fee_percent
-        self.action_space = spaces.Discrete(22)  # This will be dynamically adjusted
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(df.columns),), dtype=np.float32)
+        
+        # Define action space
+        self.action_space = spaces.Discrete(22)
+        
+        # Define observation space
+        self.observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(len(df.columns) + 5,),  # +5 for additional state information
+            dtype=np.float32
+        )
+        
+        # Initialize attributes
+        self.balance = initial_balance
+        self.btc_held = 0
+        self.current_step = 0
+        self.done = False
         self.hold_count = 0
         self.transaction_count = 0
         self.positive_trades = 0
-        self.reset()
+        self.total_trades = 0
+        self.total_profit = 0
+        self.max_portfolio_value = initial_balance
+        self.min_portfolio_value = initial_balance
+        self.last_action = None
+        self.last_trade_price = None
+        self.position_open_time = None
+        self.market_trend = 0
+        self.volatility = 0
+        self.returns = []
+        self.sharpe_ratio = 0
+        self.max_drawdown = 0
 
      
     def reset(self):
@@ -82,17 +108,43 @@ class CryptoTradingEnv(gym.Env):
         self.last_portfolio_value = self.initial_balance
         self.transaction_count = 0
         self.positive_trades = 0
+        
+        # New fields
+        self.total_trades = 0
+        self.total_profit = 0
+        self.max_portfolio_value = self.initial_balance
+        self.min_portfolio_value = self.initial_balance
+        self.last_action = None
+        self.last_trade_price = None
+        self.position_open_time = None
+        
+        # Market state trackers
+        self.market_trend = 0  # 0 for neutral, 1 for uptrend, -1 for downtrend
+        self.volatility = 0
+        
+        # Performance metrics
+        self.returns = []
+        self.sharpe_ratio = 0
+        self.max_drawdown = 0
+        
         self._update_action_space()
         return self._next_observation()
 
      
     def _next_observation(self):
-        obs = np.array([
+        # Get the market data features
+        obs = self.df.iloc[self.current_step].values
+        
+        # Add additional state information
+        additional_state = np.array([
             self.balance / self.initial_balance,
-            self.btc_held * self.df[self.current_step, Columns.CLOSE] / self.initial_balance,
-            self.df[self.current_step, Columns.CLOSE] / self.df[max(0, self.current_step-10), Columns.CLOSE] - 1,
-        ] + list(self.df[self.current_step]))
-        return obs
+            self.btc_held * self.df.iloc[self.current_step]['close'] / self.initial_balance,
+            self.market_trend,
+            self.volatility,
+            self.hold_count / 100  # Normalized hold count
+        ])
+        
+        return np.concatenate([obs, additional_state])
 
     def _update_action_space(self):
         current_price = self.df[self.current_step, 4]
@@ -106,75 +158,99 @@ class CryptoTradingEnv(gym.Env):
         self.action_space = spaces.Discrete(len(self.valid_actions))
 
      
-    def step(self, action):
-        self.current_step += 1
-        
-        if self.current_step >= len(self.df) - 1:
-            self.done = True
+def step(self, action):
+    self.current_step += 1
+    
+    if self.current_step >= len(self.df):
+        self.done = True
+        return self._next_observation(), 0, self.done, {}
 
-        current_price = self.df[self.current_step, Columns.CLOSE]
-        
-        # Calculate portfolio value before action
-        portfolio_value_before = self.balance + self.btc_held * current_price
+    current_price = self.df.iloc[self.current_step]['close']
+    
+    # Calculate portfolio value before action
+    portfolio_value_before = self.balance + self.btc_held * current_price
 
-        if action > 11:  # Buy action
-            buy_units = action - 11
-            buy_amount = buy_units / 1000 * current_price
-            fee = buy_amount * (self.transaction_fee_percent / 100)
+    if action > 11:  # Buy action
+        buy_units = action - 11
+        buy_amount = buy_units / 1000 * current_price
+        fee = buy_amount * (self.transaction_fee_percent / 100)
+        if self.balance >= (buy_amount + fee):
             self.balance -= (buy_amount + fee)
             self.btc_held += buy_units / 1000
             self.hold_count = 0
             self.transaction_count += 1
-        elif action < 11:  # Sell action
-            sell_units = action + 1
-            sell_amount = sell_units / 1000 * current_price
+            self.last_action = 'buy'
+            self.last_trade_price = current_price
+            self.position_open_time = self.current_step
+    elif action < 11:  # Sell action
+        sell_units = action + 1
+        sell_amount = (sell_units / 1000) * current_price
+        if self.btc_held >= (sell_units / 1000):
             fee = sell_amount * (self.transaction_fee_percent / 100)
             self.balance += (sell_amount - fee)
             self.btc_held -= sell_units / 1000
             self.hold_count = 0
             self.transaction_count += 1
-        else:  # Hold action
-            self.hold_count += 1
+            self.last_action = 'sell'
+            if self.last_trade_price and current_price > self.last_trade_price:
+                self.positive_trades += 1
+            self.total_profit += sell_amount - fee - (self.last_trade_price * (sell_units / 1000) if self.last_trade_price else 0)
+    else:  # Hold action
+        self.hold_count += 1
+        self.last_action = 'hold'
 
-        # Calculate portfolio value after action
-        portfolio_value_after = self.balance + self.btc_held * current_price
-        
-        # Calculate normalized reward
-        action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
-        hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
-        
-        # Normalize reward to be between -1 and 1
-        reward = np.clip(action_reward + hold_penalty, -1, 1)
+    # Calculate portfolio value after action
+    portfolio_value_after = self.balance + self.btc_held * current_price
+    
+    # Update max and min portfolio values
+    self.max_portfolio_value = max(self.max_portfolio_value, portfolio_value_after)
+    self.min_portfolio_value = min(self.min_portfolio_value, portfolio_value_after)
+    
+    # Calculate reward
+    action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
+    hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
+    reward = np.clip(action_reward + hold_penalty, -1, 1)
 
-        if action != 11 and portfolio_value_after > portfolio_value_before:
-            self.positive_trades += 1
+    # Update returns for performance metrics
+    self.returns.append(reward)
+    
+    # Update market trend and volatility
+    self.market_trend = np.sign(self.df.iloc[self.current_step]['close'] - self.df.iloc[self.current_step-1]['close'])
+    self.volatility = self.df.iloc[self.current_step]['volatility'] if 'volatility' in self.df.columns else 0
 
-        # Check end game conditions
-        portfolio_return = (portfolio_value_after / self.initial_balance) - 1
+    # Check end game conditions
+    portfolio_return = (portfolio_value_after / self.initial_balance) - 1
 
-        if portfolio_return <= -0.1:  # Lost 10% or more
-            self.done = True
-            reward = -10  # Significant penalty for major loss
-        elif portfolio_return >= 0.2:  # Gained 20% or more
-            self.done = True
-            reward = 10  # Significant reward for major gain
+    if portfolio_return <= -0.1:  # Lost 10% or more
+        self.done = True
+        reward = -10  # Significant penalty for major loss
+    elif portfolio_return >= 0.2:  # Gained 20% or more
+        self.done = True
+        reward = 10  # Significant reward for major gain
 
-        if self.done:
-            logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
+    if self.done:
+        logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
 
-        self._update_action_space()
-        next_obs = self._next_observation()
-        
-        self.last_portfolio_value = portfolio_value_after
+    self.last_portfolio_value = portfolio_value_after
 
-        return next_obs, reward, self.done, {
-            "portfolio_value": portfolio_value_after, 
-            "portfolio_return": portfolio_return,
-            "action": "Buy" if action > 11 else ("Sell" if action < 11 else "Hold"),
-            "units": abs(action - 11) if action != 11 else 0,
-            "transaction_count": self.transaction_count,
-            "positive_trades": self.positive_trades
-        }
+    # Calculate performance metrics
+    self.sharpe_ratio = self._calculate_sharpe_ratio()
+    self.max_drawdown = self._calculate_max_drawdown()
+
+    self._update_action_space()
+
+    return self._next_observation(), reward, self.done, {
+        "portfolio_value": portfolio_value_after, 
+        "portfolio_return": portfolio_return,
+        "action": self.last_action,
+        "units": abs(action - 11) if action != 11 else 0,
+        "btc_held": self.btc_held,
+        "balance": self.balance,
+        "transaction_count": self.transaction_count,
+        "positive_trades": self.positive_trades,
+        "sharpe_ratio": self.sharpe_ratio,
+        "max_drawdown": self.max_drawdown
+    }
 
 class DQNAgent:
     def __init__(self, state_size, action_size=22):
@@ -244,10 +320,14 @@ class DQNAgent:
         self.model.save(name)
 
  
-def fetch_and_preprocess_data(csv_file_path, window_size=10):
+def fetch_and_preprocess_data(csv_file_path, start_date, end_date, window_size=10):
     try:
         logger.info(f"Loading data from {csv_file_path}...")
         df = pd.read_csv(csv_file_path, index_col='timestamp', parse_dates=True)
+        
+        # Filter the dataframe for the specified date range
+        df = df.loc[start_date:end_date]
+        
         logger.info(f"Data loaded successfully. Processing {len(df)} data points...")
 
         # Ensure the data is sorted by timestamp
@@ -261,13 +341,14 @@ def fetch_and_preprocess_data(csv_file_path, window_size=10):
         scaler = StandardScaler()
         normalized_features = pd.DataFrame(scaler.fit_transform(features), columns=features.columns, index=features.index)
 
-        # Combine normalized features and target
-        df_normalized = pd.concat([normalized_features, target], axis=1)
-
-        # Create lagged features
+        # Create lagged features efficiently
+        lagged_features = {}
         for col in normalized_features.columns:
             for i in range(1, window_size):
-                df_normalized[f'{col}_lag_{i}'] = df_normalized[col].shift(i)
+                lagged_features[f'{col}_lag_{i}'] = normalized_features[col].shift(i)
+        
+        # Combine all features efficiently
+        df_normalized = pd.concat([normalized_features, pd.DataFrame(lagged_features), target], axis=1)
 
         # Drop rows with NaN values resulting from lag creation
         df_normalized = df_normalized.dropna()
@@ -428,11 +509,24 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
 # Update in the main execution block:
 if __name__ == "__main__":
     try:
-        exchange_id = 'binance'
-        symbol = 'BTC/USDT'
-        csv_file_path = 'selected_features.csv'
-        window_size = 10  # or whatever window size you prefer
-        df = fetch_and_preprocess_data(csv_file_path, window_size)
+        csv_file_path = 'selected_features.csv'        
+        # Read the first few rows to check the date range
+        df_check = pd.read_csv(csv_file_path, nrows=5)
+        df_check['timestamp'] = pd.to_datetime(df_check['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        first_timestamp = df_check['timestamp'].iloc[0]
+        logger.info(f"First timestamp in the file: {first_timestamp}")
+        
+        # Read the last few rows
+        df_check_tail = pd.read_csv(csv_file_path).tail()
+        last_timestamp = df_check_tail['timestamp'].iloc[-1]
+        logger.info(f"Last timestamp in the file: {last_timestamp}")
+        
+        # Adjust these dates based on the actual data range
+        start_date = first_timestamp.strftime('%Y-%m-%d')
+        end_date = (first_timestamp + pd.DateOffset(years=1)).strftime('%Y-%m-%d')
+        window_size = 10
+        
+        df = fetch_and_preprocess_data(csv_file_path, start_date, end_date, window_size)
 
         env = CryptoTradingEnv(df)
         state_size = env.observation_space.shape[0]
