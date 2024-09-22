@@ -280,7 +280,8 @@ class CryptoTradingEnv(gym.Env):
             "transaction_count": self.transaction_count,
             "positive_trades": self.positive_trades,
             "sharpe_ratio": self.sharpe_ratio,
-            "max_drawdown": self.max_drawdown
+            "max_drawdown": self.max_drawdown,
+            "current_step": self.current_step
         }
 
 class DQNAgent:
@@ -464,7 +465,7 @@ def plot_transaction_count(transaction_count_history):
     plt.close()
     
  
-def train_agent(env, agent, episodes, batch_size, debug=False):
+def train_agent(env, agent, episodes, batch_size, max_span, debug=False):
     total_start_time = time.time()
     total_steps = 0
     step_times = []
@@ -506,6 +507,10 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
             
             if len(agent.memory) > batch_size:
                 agent.replay(batch_size)
+                
+            if info['current_step'] > max_span:
+                done = True
+            
         
         agent.update_target_model()  # Update the target network after each episode
         
@@ -519,6 +524,7 @@ def train_agent(env, agent, episodes, batch_size, debug=False):
         performance_history.append(episode_performance)
         successful_trades_history.append((info['positive_trades'], info['transaction_count']))
         transaction_count_history.append(info['transaction_count'])
+        
         
         # if (e + 1) % 10 == 0:
         #     agent.save(f'crypto_trading_model_episode_{e+1}.h5')
@@ -567,9 +573,10 @@ if __name__ == "__main__":
 
         episodes = 100
         batch_size = 32
+        max_span = batch_size * 6
 
         logger.info("Starting training...")
-        train_agent(env, agent, episodes, batch_size, debug=False)  # Changed debug to False
+        train_agent(env, agent, episodes, batch_size, max_span, debug=False)  # Changed debug to False
         logger.info("Training completed.")
 
         # agent.save('final_crypto_trading_model.h5')
