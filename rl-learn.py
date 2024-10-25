@@ -138,6 +138,7 @@ class CryptoTradingEnv(gym.Env):
         self.returns = []
         self.sharpe_ratio = 0
         self.max_drawdown = 0
+        self.valid_actions = list(range(22))  # All actions initially valid
         
     def _calculate_sharpe_ratio(self):
         if len(self.returns) < 2:
@@ -191,6 +192,7 @@ class CryptoTradingEnv(gym.Env):
         self.returns = []
         self.sharpe_ratio = 0
         self.max_drawdown = 0
+        self._update_action_space()
         
         return self._next_observation()
 
@@ -214,15 +216,24 @@ class CryptoTradingEnv(gym.Env):
     
 
     def _update_action_space(self):
-        current_price = self.df['close'].iloc[self.current_step]
-        max_buy_units = min(10, int(self.balance // current_price))
-        max_sell_units = min(10, int(self.btc_held))
+        """Update valid actions based on current state"""
+        current_price = self.df.iloc[self.current_step]['close']
         
-        self.valid_actions = [11]  # Hold is always valid
-        self.valid_actions.extend(range(11 - max_sell_units, 11))  # Sell actions
-        self.valid_actions.extend(range(12, 12 + max_buy_units))  # Buy actions
+        # Calculate max possible units to buy/sell
+        max_buy_units = min(10, int(self.balance // (current_price * 0.001)))  # 0.001 is minimum unit
+        max_sell_units = min(10, int(self.btc_held * 1000))  # Convert BTC to units
         
-        self.action_space = spaces.Discrete(len(self.valid_actions))
+        # Hold (action 11) is always valid
+        self.valid_actions = [11]
+        
+        # Add valid sell actions (0-10)
+        self.valid_actions.extend(range(max_sell_units))
+        
+        # Add valid buy actions (12-21)
+        self.valid_actions.extend(range(12, 12 + max_buy_units))
+        
+        logger.debug(f"Valid Actions: {self.valid_actions}")
+        logger.debug(f"Max buy units: {max_buy_units}, Max sell units: {max_sell_units}")
 
     def _calculate_position_size(self, action):
         """Calculate position size based on action and current volatility"""
@@ -247,6 +258,8 @@ class CryptoTradingEnv(gym.Env):
         
         # Calculate portfolio value before action
         portfolio_value_before = self.balance + self.btc_held * current_price
+
+        self._update_action_space()
 
         if action > 11:  # Buy action
             position_size = self._calculate_position_size(action)
@@ -598,16 +611,13 @@ def validate_csv_structure(file_path):
     Returns tuple (is_valid, error_message)
     """
     required_columns = {
-        'timestamp': str,  # Will be converted to datetime
-        'open': float,
+        'timestamp': str,
+        'close': float,
         'high': float,
         'low': float,
-        'close': float,
-        'volume': float,
-        'price_change_1m': float,
-        'price_change_5m': float,
-        'volatility': float,
-        'next_return': float
+        'open': float,
+        'EMA_5': float,
+        'BBM_5_2.0': float
     }
     
     try:
