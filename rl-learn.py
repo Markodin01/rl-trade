@@ -18,14 +18,13 @@ import warnings
 from enum import IntEnum
 
 class Columns(IntEnum):
-    OPEN = 0
+    CLOSE = 0
     HIGH = 1
     LOW = 2
-    CLOSE = 3
-    VOLUME = 4
-    PRICE_CHANGE_1M = 5
-    PRICE_CHANGE_5M = 6
-    VOLATILITY = 7
+    OPEN = 3
+    EMA_5 = 4
+    BBM_5 = 5
+    VOLATILITY = 6
 
 # Set up logging
 log_dir = "training_logs"
@@ -59,25 +58,67 @@ def timer(func):
         return result
     return wrapper
 
+def calculate_historical_volatility(df, window=20):
+    """
+    Calculate historical volatility using log returns
+    window: number of periods (default 20 for approximately 1 month of trading days)
+    """
+    # Calculate log returns
+    log_returns = np.log(df['close'] / df['close'].shift(1))
+    
+    # Calculate historical volatility (annualized)
+    hist_vol = log_returns.rolling(window=window).std() * np.sqrt(252)  # 252 trading days in a year
+    
+    return hist_vol
+
+def prepare_data_with_volatility(df):
+    """
+    Prepare the dataframe with all required features including volatility
+    """
+    # Calculate historical volatility
+    df['volatility'] = calculate_historical_volatility(df)
+    
+    # Calculate True Range for additional volatility insight
+    df['tr'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)),
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    
+    # Average True Range (ATR)
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    
+    # Volatility adjusted features
+    df['vol_adjusted_range'] = (df['high'] - df['low']) / df['volatility']
+    
+    return df
+
 class CryptoTradingEnv(gym.Env):
     def __init__(self, df, initial_balance=10000, transaction_fee_percent=0.1):
         super(CryptoTradingEnv, self).__init__()
-        self.df = df  # Keep as DataFrame instead of converting to numpy
+        
+        # Prepare dataframe with essential features and volatility
+        required_columns = ['close', 'high', 'low', 'open', 'EMA_5', 'BBM_5_2.0']
+        self.df = df[required_columns].copy()
+        self.df['volatility'] = calculate_historical_volatility(self.df)
+        
         self.initial_balance = initial_balance
         self.transaction_fee_percent = transaction_fee_percent
         
-        # Define action space
+        # Keep original action space
         self.action_space = spaces.Discrete(22)
         
-        # Define observation space
+        # Observation space including all features
         self.observation_space = spaces.Box(
             low=-np.inf, 
             high=np.inf, 
-            shape=(len(df.columns) + 5,),  # +5 for additional state information
+            shape=(len(self.df.columns) + 5,),  # +5 for additional state information
             dtype=np.float32
         )
         
-        # Initialize attributes
+        # Initialize all tracking attributes
         self.balance = initial_balance
         self.btc_held = 0
         self.current_step = 0
@@ -136,11 +177,8 @@ class CryptoTradingEnv(gym.Env):
         self.current_step = 0
         self.done = False
         self.hold_count = 0
-        self.last_portfolio_value = self.initial_balance
         self.transaction_count = 0
         self.positive_trades = 0
-        
-        # New fields
         self.total_trades = 0
         self.total_profit = 0
         self.max_portfolio_value = self.initial_balance
@@ -148,17 +186,12 @@ class CryptoTradingEnv(gym.Env):
         self.last_action = None
         self.last_trade_price = None
         self.position_open_time = None
-        
-        # Market state trackers
-        self.market_trend = 0  # 0 for neutral, 1 for uptrend, -1 for downtrend
+        self.market_trend = 0
         self.volatility = 0
-        
-        # Performance metrics
         self.returns = []
         self.sharpe_ratio = 0
         self.max_drawdown = 0
         
-        self._update_action_space()
         return self._next_observation()
 
      
@@ -167,15 +200,18 @@ class CryptoTradingEnv(gym.Env):
         obs = self.df.iloc[self.current_step].values
         
         # Add additional state information
+        portfolio_value = self.balance + self.btc_held * self.df.iloc[self.current_step]['close']
+        
         additional_state = np.array([
-            self.balance / self.initial_balance,
-            self.btc_held * self.df.iloc[self.current_step]['close'] / self.initial_balance,
-            self.market_trend,
-            self.volatility,
+            self.balance / self.initial_balance,  # Normalized balance
+            self.btc_held * self.df.iloc[self.current_step]['close'] / self.initial_balance,  # Normalized position value
+            self.market_trend,  # Current market trend
+            self.df.iloc[self.current_step]['volatility'],  # Current volatility
             self.hold_count / 100  # Normalized hold count
         ])
-        
+
         return np.concatenate([obs, additional_state])
+    
 
     def _update_action_space(self):
         current_price = self.df['close'].iloc[self.current_step]
@@ -188,7 +224,18 @@ class CryptoTradingEnv(gym.Env):
         
         self.action_space = spaces.Discrete(len(self.valid_actions))
 
+    def _calculate_position_size(self, action):
+        """Calculate position size based on action and current volatility"""
+        current_volatility = self.df.iloc[self.current_step]['volatility']
+        base_size = abs(action - 11) / 1000  # Original calculation
+        
+        # Adjust size based on volatility
+        volatility_factor = 1.0 / (1.0 + current_volatility)
+        adjusted_size = base_size * volatility_factor
+        
+        return adjusted_size
      
+
     def step(self, action):
         self.current_step += 1
         
@@ -202,30 +249,35 @@ class CryptoTradingEnv(gym.Env):
         portfolio_value_before = self.balance + self.btc_held * current_price
 
         if action > 11:  # Buy action
-            buy_units = action - 11
-            buy_amount = buy_units / 1000 * current_price
+            position_size = self._calculate_position_size(action)
+            buy_amount = position_size * current_price
             fee = buy_amount * (self.transaction_fee_percent / 100)
+            
             if self.balance >= (buy_amount + fee):
                 self.balance -= (buy_amount + fee)
-                self.btc_held += buy_units / 1000
+                self.btc_held += position_size
                 self.hold_count = 0
                 self.transaction_count += 1
+                self.total_trades += 1
                 self.last_action = 'buy'
                 self.last_trade_price = current_price
                 self.position_open_time = self.current_step
+                
         elif action < 11:  # Sell action
-            sell_units = action + 1
-            sell_amount = (sell_units / 1000) * current_price
-            if self.btc_held >= (sell_units / 1000):
+            position_size = self._calculate_position_size(action)
+            if self.btc_held >= position_size:
+                sell_amount = position_size * current_price
                 fee = sell_amount * (self.transaction_fee_percent / 100)
                 self.balance += (sell_amount - fee)
-                self.btc_held -= sell_units / 1000
+                self.btc_held -= position_size
                 self.hold_count = 0
                 self.transaction_count += 1
+                self.total_trades += 1
                 self.last_action = 'sell'
                 if self.last_trade_price and current_price > self.last_trade_price:
                     self.positive_trades += 1
-                self.total_profit += sell_amount - fee - (self.last_trade_price * (sell_units / 1000) if self.last_trade_price else 0)
+                self.total_profit += sell_amount - fee - (self.last_trade_price * position_size if self.last_trade_price else 0)
+                
         else:  # Hold action
             self.hold_count += 1
             self.last_action = 'hold'
@@ -233,45 +285,39 @@ class CryptoTradingEnv(gym.Env):
         # Calculate portfolio value after action
         portfolio_value_after = self.balance + self.btc_held * current_price
         
-        # Update max and min portfolio values
+        # Update portfolio tracking
         self.max_portfolio_value = max(self.max_portfolio_value, portfolio_value_after)
         self.min_portfolio_value = min(self.min_portfolio_value, portfolio_value_after)
         
-        # Calculate reward
-        action_reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
-        hold_penalty = -0.01 * (self.hold_count / 100)  # Normalized hold penalty
-        reward = np.clip(action_reward + hold_penalty, -1, 1)
+        # Calculate reward with volatility adjustment
+        raw_return = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
+        current_volatility = self.df.iloc[self.current_step]['volatility']
+        volatility_adjusted_return = raw_return / (current_volatility if current_volatility > 0 else 1)
+        
+        # Add holding penalty (adjusted for volatility)
+        hold_penalty = -0.01 * (self.hold_count / 100) * (1 - min(current_volatility, 0.5))
+        reward = np.clip(volatility_adjusted_return + hold_penalty, -1, 1)
 
         # Update returns for performance metrics
         self.returns.append(reward)
         
         # Update market trend and volatility
-        self.market_trend = np.sign(self.df.iloc[self.current_step]['close'] - self.df.iloc[self.current_step-1]['close'])
-        self.volatility = self.df.iloc[self.current_step]['volatility'] if 'volatility' in self.df.columns else 0
+        self.market_trend = np.sign(self.df.iloc[self.current_step]['close'] - 
+                                  self.df.iloc[self.current_step-1]['close'])
+        self.volatility = current_volatility
 
-        # Check end game conditions
+        # Check termination conditions
         portfolio_return = (portfolio_value_after / self.initial_balance) - 1
 
         if portfolio_return <= -0.1:  # Lost 10% or more
             self.done = True
-            reward = -10  # Significant penalty for major loss
+            reward = -10
         elif portfolio_return >= 0.2:  # Gained 20% or more
             self.done = True
-            reward = 10  # Significant reward for major gain
+            reward = 10
 
-        if self.done:
-            logger.info(f"Episode ended. Portfolio value: ${portfolio_value_after:.2f}, Return: {portfolio_return:.2%}")
-
-        self.last_portfolio_value = portfolio_value_after
-
-        # Calculate performance metrics
-        self.sharpe_ratio = self._calculate_sharpe_ratio()
-        self.max_drawdown = self._calculate_max_drawdown()
-
-        self._update_action_space()
-
-        return self._next_observation(), reward, self.done, {
-            "portfolio_value": portfolio_value_after, 
+        info = {
+            "portfolio_value": portfolio_value_after,
             "portfolio_return": portfolio_return,
             "action": self.last_action,
             "units": abs(action - 11) if action != 11 else 0,
@@ -279,10 +325,13 @@ class CryptoTradingEnv(gym.Env):
             "balance": self.balance,
             "transaction_count": self.transaction_count,
             "positive_trades": self.positive_trades,
-            "sharpe_ratio": self.sharpe_ratio,
-            "max_drawdown": self.max_drawdown,
-            "current_step": self.current_step
+            "sharpe_ratio": self._calculate_sharpe_ratio(),
+            "max_drawdown": self._calculate_max_drawdown(),
+            "current_step": self.current_step,
+            "volatility": current_volatility
         }
+
+        return self._next_observation(), reward, self.done, info
 
 class DQNAgent:
     def __init__(self, state_size, action_size=22):
@@ -543,44 +592,204 @@ def train_agent(env, agent, episodes, batch_size, max_span, debug=False):
     plot_successful_trades_percentage(successful_trades_history)
     plot_transaction_count(transaction_count_history)
 
-# Update in the main execution block:
-if __name__ == "__main__":
+def validate_csv_structure(file_path):
+    """
+    Validates the structure and content of the input CSV file.
+    Returns tuple (is_valid, error_message)
+    """
+    required_columns = {
+        'timestamp': str,  # Will be converted to datetime
+        'open': float,
+        'high': float,
+        'low': float,
+        'close': float,
+        'volume': float,
+        'price_change_1m': float,
+        'price_change_5m': float,
+        'volatility': float,
+        'next_return': float
+    }
+    
     try:
-        csv_file_path = 'selected_features.csv'        
-        # Read the first few rows to check the date range
-        df_check = pd.read_csv(csv_file_path, nrows=5)
+        # Check if file exists
+        if not os.path.exists(file_path):
+            return False, f"File not found: {file_path}"
+            
+        # Try reading the first few rows
+        try:
+            df = pd.read_csv(file_path, nrows=5)
+        except pd.errors.EmptyDataError:
+            return False, "CSV file is empty"
+        except pd.errors.ParserError:
+            return False, "Invalid CSV format"
+            
+        # Check for required columns
+        missing_columns = set(required_columns.keys()) - set(df.columns)
+        if missing_columns:
+            return False, f"Missing required columns: {', '.join(missing_columns)}"
+            
+        # Check column data types and values
+        for col, expected_type in required_columns.items():
+            # Skip timestamp as it needs special handling
+            if col == 'timestamp':
+                try:
+                    pd.to_datetime(df[col])
+                except (ValueError, TypeError):
+                    return False, f"Invalid timestamp format in column: {col}"
+                continue
+                
+            # Check if column can be converted to expected type
+            try:
+                df[col].astype(expected_type)
+            except (ValueError, TypeError):
+                return False, f"Invalid data type in column: {col}. Expected {expected_type.__name__}"
+                
+            # Check for NaN values
+            if df[col].isnull().any():
+                return False, f"Found NaN values in column: {col}"
+                
+            # For numeric columns, check for infinite values
+            if expected_type in (float, int):
+                if np.isinf(df[col]).any():
+                    return False, f"Found infinite values in column: {col}"
+                    
+        # Check if data is sorted by timestamp
+        if not df['timestamp'].is_monotonic_increasing:
+            return False, "Data is not sorted by timestamp"
+            
+        # All validations passed
+        return True, "Validation successful"
+        
+    except Exception as e:
+        return False, f"Unexpected error during validation: {str(e)}"
+
+def validate_and_load_data(file_path, start_date, end_date, window_size=10):
+    """
+    Validates and loads the CSV file with proper error handling.
+    Returns preprocessed DataFrame or raises exception with detailed error message.
+    """
+    logger.info(f"Validating CSV file: {file_path}")
+    
+    # Run validation
+    is_valid, validation_message = validate_csv_structure(file_path)
+    if not is_valid:
+        logger.error(f"CSV validation failed: {validation_message}")
+        raise ValueError(f"CSV validation failed: {validation_message}")
+    
+    logger.info("CSV validation successful. Loading data...")
+    
+    try:
+        # Load and preprocess data using existing function
+        df = fetch_and_preprocess_data(file_path, start_date, end_date, window_size)
+        
+        # Additional post-load validations
+        if len(df) == 0:
+            raise ValueError("No data available for the specified date range")
+            
+        if df.isnull().any().any():
+            raise ValueError("Preprocessed data contains NaN values")
+            
+        logger.info(f"Successfully loaded {len(df)} rows of data")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error during data loading and preprocessing: {str(e)}")
+        raise
+
+def load_initial_timestamps(csv_path):
+    """Separate function to load and validate timestamps"""
+    try:
+        df_check = pd.read_csv(csv_path, nrows=5)
         df_check['timestamp'] = pd.to_datetime(df_check['timestamp'], format='%Y-%m-%d %H:%M:%S')
         first_timestamp = df_check['timestamp'].iloc[0]
-        logger.info(f"First timestamp in the file: {first_timestamp}")
         
-        # Read the last few rows
-        df_check_tail = pd.read_csv(csv_file_path).tail()
+        df_check_tail = pd.read_csv(csv_path).tail()
+        df_check_tail['timestamp'] = pd.to_datetime(df_check_tail['timestamp'])
         last_timestamp = df_check_tail['timestamp'].iloc[-1]
-        logger.info(f"Last timestamp in the file: {last_timestamp}")
         
-        # Adjust these dates based on the actual data range
-        start_date = first_timestamp.strftime('%Y-%m-%d')
-        end_date = (first_timestamp + pd.DateOffset(years=1)).strftime('%Y-%m-%d')
-        window_size = 10
-        
-        df = fetch_and_preprocess_data(csv_file_path, start_date, end_date, window_size)
+        return first_timestamp, last_timestamp
+    except FileNotFoundError:
+        logger.error(f"CSV file not found: {csv_path}")
+        raise
+    except pd.errors.EmptyDataError:
+        logger.error("CSV file is empty")
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid timestamp format in CSV: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while loading timestamps: {e}")
+        raise
 
+def initialize_agent_and_env(df):
+    """Separate function to initialize the agent and environment"""
+    try:
         env = CryptoTradingEnv(df)
         state_size = env.observation_space.shape[0]
-        action_size = 22  # Fixed to maximum possible actions
+        action_size = 22
         agent = DQNAgent(state_size, action_size)
+        
         logger.info(f"Initialized environment and agent. State size: {state_size}, Action size: {action_size}")
-
-        episodes = 100
-        batch_size = 32
-        max_span = batch_size * 6
-
-        logger.info("Starting training...")
-        train_agent(env, agent, episodes, batch_size, max_span, debug=False)  # Changed debug to False
-        logger.info("Training completed.")
-
-        # agent.save('final_crypto_trading_model.h5')
-        # logger.info("Final model saved as 'final_crypto_trading_model.h5'")
+        return env, agent
+    except ValueError as e:
+        logger.error(f"Invalid environment or agent parameters: {e}")
+        raise
     except Exception as e:
-        logger.error(f"An error occurred during execution: {str(e)}")
-        raise  # Re-raise the exception to see the full traceback
+        logger.error(f"Unexpected error during initialization: {e}")
+        raise
+
+if __name__ == "__main__":
+    csv_file_path = 'selected_features.csv'
+    window_size = 10
+    
+    # Step 1: Load timestamps
+    try:
+        first_timestamp, last_timestamp = load_initial_timestamps(csv_file_path)
+        logger.info(f"First timestamp: {first_timestamp}")
+        logger.info(f"Last timestamp: {last_timestamp}")
+    except Exception as e:
+        logger.error("Failed to load timestamps")
+        raise SystemExit(1)
+
+    # Step 2: Set date range
+    start_date = first_timestamp.strftime('%Y-%m-%d')
+    end_date = (first_timestamp + pd.DateOffset(years=1)).strftime('%Y-%m-%d')
+    
+    # Step 3: Load and validate data
+    try:
+        df = validate_and_load_data(
+            file_path=csv_file_path,
+            start_date=start_date,
+            end_date=end_date,
+            window_size=window_size
+        )
+    except ValueError as e:
+        logger.error(f"Data validation failed: {e}")
+        raise SystemExit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error during data loading: {e}")
+        raise SystemExit(1)
+
+    # Step 4: Initialize environment and agent
+    try:
+        env, agent = initialize_agent_and_env(df)
+    except Exception as e:
+        logger.error("Failed to initialize environment and agent")
+        raise SystemExit(1)
+
+    # Step 5: Training setup
+    episodes = 500
+    batch_size = 64
+    max_span = batch_size * 6
+
+    # Step 6: Run training
+    try:
+        logger.info("Starting training...")
+        train_agent(env, agent, episodes, batch_size, max_span, debug=False)
+        logger.info("Training completed successfully")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        raise SystemExit(0)
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise SystemExit(1)
