@@ -516,19 +516,19 @@ class CryptoTradingEnvLongShort(gym.Env):
         else:
             portfolio_value = self.balance
         
-        # Additional rewards/penalties
+        # In step() function, around line 850:
         if self.position_type != 0 and self.entry_price:
             if self.position_type == 1:
                 step_return = (current_price - prev_price) / prev_price
             else:
                 step_return = (prev_price - current_price) / prev_price
-            reward += step_return * 200  # Increased from 100 to 200
+            reward += step_return * 500  # Increased from 200
         
-        # Penalize being flat during large price moves
-        if self.position_type == 0:
+        # In step() function, after the hold reward calculation:
+        if self.position_type == 0:  # FLAT
             price_move_pct = abs(current_price - prev_price) / prev_price
-            if price_move_pct > 0.01:  # >1% move
-                reward -= price_move_pct * 50  # Opportunity cost penalty
+            if price_move_pct > 0.02:  # >2% move
+                reward -= price_move_pct * 200  # Strong penalty for missing big moves
         
         self.max_portfolio_value = max(self.max_portfolio_value, portfolio_value)
         self.episode_rewards.append(reward)
@@ -584,54 +584,48 @@ class CryptoTradingEnvLongShort(gym.Env):
             return (self.entry_price - current_price) / self.entry_price
     
     def _open_long(self, price):
-        """Open long position with volatility-adjusted sizing"""
-        # Adjust position size based on current volatility
-        current_vol = self.df_normalized.iloc[self.current_step]['volatility']
+        """Open long position - use ALL capital"""
+        # Calculate how much we can buy with all capital after fees
+        available = self.balance
+        fee_pct = self.transaction_fee_percent / 100
         
-        # If volatility is very high (>1.0), reduce position size
-        if current_vol > 1.0:
-            position_pct = 0.50  # Only 50% in high volatility
-        elif current_vol > 0.5:
-            position_pct = 0.70  # 70% in medium volatility
-        else:
-            position_pct = 0.95  # 95% in low volatility
+        # Amount to spend on BTC (before fee)
+        buy_amount = available / (1 + fee_pct)
+        fee = available - buy_amount
         
-        buy_amount = self.balance * position_pct
-        fee = buy_amount * (self.transaction_fee_percent / 100)
-        
-        if self.balance >= (buy_amount + fee):
-            self.btc_held = (buy_amount - fee) / price
-            self.balance -= buy_amount
-            self.entry_price = price
-            self.position_open_time = self.current_step
-            self.position_type = 1
-            self.transaction_count += 1
-            return True
-        return False
+        self.btc_held = buy_amount / price
+        self.balance = 0  # Use all capital
+        self.entry_price = price
+        self.position_open_time = self.current_step
+        self.position_type = 1
+        self.transaction_count += 1
+        return True
     
     def _close_long(self, price):
-        """Close long position with simplified rewards"""
-        sell_amount = self.btc_held * price
-        fee = sell_amount * (self.transaction_fee_percent / 100)
-        self.balance += (sell_amount - fee)
+        """Close long position"""
+        # Calculate sell proceeds
+        btc_value = self.btc_held * price
+        fee = btc_value * (self.transaction_fee_percent / 100)
+        proceeds = btc_value - fee
+        
+        self.balance = proceeds  # Return all to cash
         
         trade_return = (price - self.entry_price) / self.entry_price
         
-        # Stronger rewards to encourage profitable trades
-        reward = trade_return * 1000  # Increased from 200 to 500
+        # Reward structure (keep your existing rewards)
+        reward = trade_return * 2000
         
-        # Better bonuses
         if trade_return > 0.10:
-            reward += 100  # Increased from 20
+            reward += 200
         elif trade_return > 0.05:
-            reward += 50  # Increased from 10
+            reward += 100
         elif trade_return > 0.02:
-            reward += 25
+            reward += 50
         
-        # Penalty for losing trades
-        if trade_return < -0.02:
-            reward -= 30
+        if trade_return < -0.05:
+            reward -= 50
         
+        # Track stats
         if trade_return > 0:
             self.positive_trades += 1
             self.positive_long_trades += 1
@@ -647,61 +641,53 @@ class CryptoTradingEnvLongShort(gym.Env):
         return reward
     
     def _open_short(self, price):
-        """Open short position with volatility-adjusted sizing"""
-        # Adjust position size based on current volatility
-        current_vol = self.df_normalized.iloc[self.current_step]['volatility']
+        """Open short position - use ALL capital"""
+        available = self.balance
+        fee_pct = self.transaction_fee_percent / 100
         
-        # If volatility is very high (>1.0), reduce position size
-        if current_vol > 1.0:
-            position_pct = 0.50  # Only 50% in high volatility
-        elif current_vol > 0.5:
-            position_pct = 0.70  # 70% in medium volatility
-        else:
-            position_pct = 0.95  # 95% in low volatility
+        # Amount to short (before fee)
+        short_amount = available / (1 + fee_pct)
+        fee = available - short_amount
         
-        position_size = self.balance * position_pct
-        fee = position_size * (self.transaction_fee_percent / 100)
-        
-        if self.balance >= (position_size + fee):
-            self.btc_held = position_size / price
-            self.balance -= fee
-            self.entry_price = price
-            self.short_value_at_entry = position_size
-            self.position_open_time = self.current_step
-            self.position_type = -1
-            self.transaction_count += 1
-            return True
-        return False
+        self.btc_held = short_amount / price  # BTC owed
+        self.short_value_at_entry = short_amount  # USD value at entry
+        self.balance = 0  # Use all capital
+        self.entry_price = price
+        self.position_open_time = self.current_step
+        self.position_type = -1
+        self.transaction_count += 1
+        return True
     
     def _close_short(self, price):
         """Close short position"""
+        # Cost to buy back the BTC
         buyback_cost = self.btc_held * price
         fee = buyback_cost * (self.transaction_fee_percent / 100)
         total_cost = buyback_cost + fee
         
+        # PnL = what we sold for - what we bought back for
         pnl = self.short_value_at_entry - total_cost
-        self.balance += pnl
-        
-        trade_return = (self.entry_price - price) / self.entry_price
+        self.balance = pnl
         
         # Ensure balance doesn't go negative
         if self.balance < 0:
             logger.warning(f"Short closed with negative balance: ${self.balance:.2f}")
             self.balance = max(0.01, self.balance)
         
-        # Stronger rewards
-        reward = trade_return * 500  # Increased from 200 to 500
+        trade_return = (self.entry_price - price) / self.entry_price
+        
+        # Reward structure
+        reward = trade_return * 2000
         
         if trade_return > 0.10:
-            reward += 50
+            reward += 200
         elif trade_return > 0.05:
-            reward += 30
+            reward += 100
         elif trade_return > 0.02:
-            reward += 15
+            reward += 50
         
-        # Penalty for losing trades
-        if trade_return < -0.02:
-            reward -= 30
+        if trade_return < -0.05:
+            reward -= 50
         
         if trade_return > 0:
             self.positive_trades += 1
@@ -762,16 +748,20 @@ class CryptoTradingEnvLongShort(gym.Env):
         
         # return reward
         # Replace complex hold_reward logic with simple:
-        if self.position_type == 0:
-            return -0.2  # Penalty for being flat
+        if self.position_type == 0:  # FLAT
+            # Stronger penalty for missing moves
+            price_move_pct = abs(current_price - prev_price) / prev_price
+            if price_move_pct > 0.01:  # >1% move
+                return -5.0  # Increased from -0.2
+            return -0.5  # Still penalize being flat
         
-        # Reward/punish based on position direction vs price movement
+        # In position: reward/punish based on direction
         if self.position_type == 1:  # LONG
             step_pnl = (current_price - prev_price) / prev_price
         else:  # SHORT
             step_pnl = (prev_price - current_price) / prev_price
         
-        return step_pnl * 200  # Simple: reward correct direction
+        return step_pnl * 500  # Increased from 200
     
     def _handle_episode_end(self):
         """Handle episode termination"""
@@ -861,14 +851,14 @@ class DuelingDQNAgent:
     Separates value and advantage streams for better learning
     """
     
-    def __init__(self, state_size, action_size=5, learning_rate=0.0015):
+    def __init__(self, state_size, action_size=5, learning_rate=0.002):
         self.state_size = state_size
         self.action_size = action_size
         self.memory = PrioritizedReplayBuffer(capacity=10000, alpha=0.6)
         self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_min = 0.1
-        self.epsilon_decay = 0.997
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
         self.learning_rate = learning_rate
         self.beta = 0.4  # Initial beta for importance sampling
         self.beta_increment = 0.001  # Anneal beta to 1.0
@@ -951,17 +941,16 @@ class DuelingDQNAgent:
         # Greedy action selection with masking
         act_values = self.model.predict(state, verbose=0)[0]
         masked_values = np.where(valid_actions_mask, act_values, -np.inf)
+            
+        # REMOVE THIS ENTIRE BLOCK or lower threshold to 0.1-0.3
+        # best_action = np.argmax(masked_values)
+        # best_value = masked_values[best_action]
+        # hold_value = masked_values[0]
+        # 
+        # if best_action != 0 and abs(best_value - hold_value) < 0.5:
+        #     return 0
         
-        best_action = np.argmax(masked_values)
-        best_value = masked_values[best_action]
-        hold_value = masked_values[0]  # HOLD is always action 0
-        
-        # High-conviction trading: only trade if signal is MUCH better than HOLD
-        # This prevents churning on weak signals
-        if best_action != 0 and abs(best_value - hold_value) < 0.5:  # Much lower
-            return 0
-        
-        return best_action
+        return np.argmax(masked_values)  # Just take the best action!
     
     def replay(self, batch_size):
         """
@@ -1434,7 +1423,7 @@ if __name__ == "__main__":
     logger.info(f"  Memory: Prioritized Experience Replay (10000 capacity)")
     logger.info(f"  Gamma: 0.99, LR: 0.0005, Gradient Clipping: 1.0")
     
-    agent = DuelingDQNAgent(state_size, action_size, learning_rate=0.0015)  # Increased from 0.0005
+    agent = DuelingDQNAgent(state_size, action_size, learning_rate=0.002)  # Increased from 0.0005
     
     logger.info("\n" + "="*60)
     logger.info("SANITY CHECK: Testing System")
@@ -1482,7 +1471,7 @@ if __name__ == "__main__":
     logger.info("="*60 + "\n")
     
     episodes = 1000
-    batch_size = 64  # Reduced from 64 to 32 for faster training
+    batch_size = 32  # Reduced from 64 to 32 for faster training
     warmup_episodes = 100  # Fill replay buffer for 100 episodes before training
     
     logger.info("="*60)
