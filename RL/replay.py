@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-Prioritized Experience Replay - simple NumPy / Python implementation.
+Prioritized Experience Replay - FIXED VERSION
+- Fixed shape mismatch in update_priorities
 """
 
 import numpy as np
@@ -35,6 +36,7 @@ class PrioritizedReplay:
         idx = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
 
         samples = [self.buffer[i] for i in idx]
+        
         # importance-sampling weights
         N = len(self.buffer)
         weights = (N * probs[idx]) ** (-beta)
@@ -42,5 +44,15 @@ class PrioritizedReplay:
         return samples, idx, weights.astype(np.float32)
 
     def update_priorities(self, indices, td_errors):
-        # add a tiny epsilon to keep priorities > 0
+        """
+        FIXED: Flatten td_errors to ensure shape compatibility
+        
+        Args:
+            indices: array of indices (shape: (batch_size,))
+            td_errors: TD errors (shape: (batch_size,) or (batch_size, 1))
+        """
+        # Flatten to ensure 1D array
+        td_errors = np.asarray(td_errors).flatten()
+        
+        # Add small epsilon to keep priorities > 0
         self.prios[indices] = np.abs(td_errors) + 1e-6
