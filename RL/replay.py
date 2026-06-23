@@ -1,58 +1,53 @@
 #!/usr/bin/env python
 """
-Prioritized Experience Replay - FIXED VERSION
-- Fixed shape mismatch in update_priorities
+Prioritized Experience Replay - CORRECTED VERSION
+
+Fixes vs the previous implementation:
+  - Data and priorities now share ONE ring index (self.pos). The old version
+    stored data in a deque(maxlen) but priorities in a fixed ring array; once
+    the buffer filled, deque.append() shifted every element's positional index
+    while prios[pos] overwrote cyclically, so priorities/IS-weights became
+    permanently attached to the WRONG transitions.
+  - Standard PER sampling with replacement (replace=True).
+  - max priority is computed only over written slots.
 """
 
 import numpy as np
-from collections import deque
+
 
 class PrioritizedReplay:
     def __init__(self, capacity: int = 100_000, alpha: float = 0.6):
         self.capacity = capacity
         self.alpha = alpha
-        self.buffer = deque(maxlen=capacity)
+        self.data = [None] * capacity
         self.prios = np.zeros(capacity, dtype=np.float32)
         self.pos = 0
+        self.size = 0
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
     def add(self, *transition):
-        # The new transition gets the *max* priority so it will be sampled at least once.
-        max_prio = self.prios.max() if self.buffer else 1.0
-        self.buffer.append(transition)
+        # New transition gets the current max priority so it is sampled at least once.
+        max_prio = self.prios[:self.size].max() if self.size > 0 else 1.0
+        self.data[self.pos] = transition
         self.prios[self.pos] = max_prio
         self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int, beta: float = 0.4):
-        if len(self.buffer) == self.capacity:
-            priorities = self.prios
-        else:
-            priorities = self.prios[:len(self.buffer)]
-
+        priorities = self.prios[:self.size]
         probs = priorities ** self.alpha
-        probs /= probs.sum()
-        idx = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
+        probs = probs / probs.sum()
 
-        samples = [self.buffer[i] for i in idx]
-        
+        idx = np.random.choice(self.size, batch_size, p=probs, replace=True)
+        samples = [self.data[i] for i in idx]
+
         # importance-sampling weights
-        N = len(self.buffer)
-        weights = (N * probs[idx]) ** (-beta)
+        weights = (self.size * probs[idx]) ** (-beta)
         weights /= weights.max()
         return samples, idx, weights.astype(np.float32)
 
     def update_priorities(self, indices, td_errors):
-        """
-        FIXED: Flatten td_errors to ensure shape compatibility
-        
-        Args:
-            indices: array of indices (shape: (batch_size,))
-            td_errors: TD errors (shape: (batch_size,) or (batch_size, 1))
-        """
-        # Flatten to ensure 1D array
         td_errors = np.asarray(td_errors).flatten()
-        
-        # Add small epsilon to keep priorities > 0
         self.prios[indices] = np.abs(td_errors) + 1e-6

@@ -77,8 +77,10 @@ class DuelingDQNAgent:
             self.epsilon = float(self.epsilon)
 
     # -----------------------------------------------------------------------
-    def remember(self, s, a, r, s_next, d):
-        self.memory.add(s, a, r, s_next, d)
+    def remember(self, s, a, r, s_next, d, next_mask):
+        # next_mask = valid-action mask for s_next, needed so the Double-DQN
+        # target does not bootstrap from illegal next-state actions.
+        self.memory.add(s, a, r, s_next, d, next_mask)
 
     # -----------------------------------------------------------------------
     def replay(self, batch_size: int):
@@ -100,10 +102,15 @@ class DuelingDQNAgent:
                                    dtype=torch.float32, device=device)
         dones = torch.tensor([b[4] for b in batch],
                             dtype=torch.float32, device=device).unsqueeze(1)
+        next_masks = torch.tensor(np.vstack([b[5] for b in batch]),
+                                  dtype=torch.float32, device=device)
 
-        # ---- double-DQN target
+        # ---- double-DQN target (mask illegal next-state actions before argmax)
         with torch.no_grad():
             next_q_vals = self.policy(next_states)
+            # FIX: previously argmax ran over ALL 5 actions; illegal actions return
+            # -10 and never execute, so bootstrapping off them poisoned Q-values.
+            next_q_vals = next_q_vals.masked_fill(next_masks == 0, -1e9)
             next_actions = next_q_vals.max(1)[1].unsqueeze(1)
             target_q_vals = self.target(next_states)
             next_q_target = target_q_vals.gather(1, next_actions)
@@ -117,22 +124,11 @@ class DuelingDQNAgent:
         loss = F.smooth_l1_loss(q_pred, td_target, reduction="none")
         loss = (loss * torch.tensor(is_weights, device=device).unsqueeze(1)).mean()
 
-        # ---- back-prop with PROPER autocast for MPS
+        # ---- back-prop (fp32). The previous autocast-around-backward() block was
+        # a no-op: autocast governs FORWARD-op precision, and all forwards already
+        # ran in fp32 above. For this tiny MLP, plain fp32 is correct and fast.
         self.optimizer.zero_grad()
-        
-        # FIXED: Use torch.autocast with device_type and dtype for MPS
-        # MPS supports float16 and bfloat16 (bfloat16 requires macOS 14+)
-        if device.type == 'mps':
-            # Use autocast with explicit dtype for MPS
-            with torch.autocast(device_type='mps', dtype=torch.float16):
-                loss.backward()
-        elif device.type == 'cuda':
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                loss.backward()
-        else:
-            # CPU - no autocast needed
-            loss.backward()
-        
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.optimizer.step()
 

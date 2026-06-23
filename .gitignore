@@ -164,3 +164,22 @@ imgs/
 #.idea/
 
 data/
+
+training_logs/
+RL/training_logs/
+archive/
+
+# Large data files
+*.csv
+!RL/analysis/*.csv
+*.parquet
+*.npy
+*.pth
+*.pkl
+
+# macOS
+.DS_Store
+
+# Analysis outputs (keep source, not outputs)
+RL/analysis/*.png
+RL/analysis/*.json

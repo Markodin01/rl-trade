@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 """
-FIXED Training Script:
-    - Replay buffer size management (clear old samples)
-    - Fixed logging threshold
-    - Better episode tracking
-    - Progress monitoring
+IMPROVED Training Script:
+    - Sharpe-based reward mode (fixes "1-trade coasting")
+    - Step-by-step logging
+    - Better episode analysis
+    - Comparative visualizations
 
 Usage:
-    python train_fixed.py                    # Full training (1500 episodes)
-    python train_fixed.py --quick            # Quick test (100 episodes)
-    python train_fixed.py --no-filter        # Disable conviction filter
+    python train_improved.py --reward sharpe     # Recommended: Sharpe-based
+    python train_improved.py --reward pnl        # Old approach
+    python train_improved.py --reward hybrid     # Combination
+    python train_improved.py --quick             # Quick test (100 episodes)
 """
 
 import argparse
@@ -27,25 +28,25 @@ from utils import AdvancedLogger
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true', help='Quick test (100 episodes)')
-    parser.add_argument('--no-filter', action='store_true', help='Disable conviction filter')
-    parser.add_argument('--threshold', type=float, default=0.5, help='Conviction threshold (default: 0.5)')
-    parser.add_argument('--episodes', type=int, default=None, help='Number of episodes (overrides --quick)')
+    parser.add_argument('--reward', type=str, default='sharpe', 
+                       choices=['sharpe', 'pnl', 'hybrid'],
+                       help='Reward mode: sharpe (continuous), pnl (sparse), hybrid')
+    parser.add_argument('--episodes', type=int, default=None)
+    parser.add_argument('--analyze-best', type=int, default=5,
+                       help='Number of best/worst episodes to analyze in detail')
     args = parser.parse_args()
     
     # Configuration
     if args.episodes:
         episodes = args.episodes
     else:
-        episodes = 100 if args.quick else 1500
-    use_filter = not args.no_filter
+        episodes = 100 if args.quick else 1000
     
     print("="*80)
-    print("CRYPTO RL TRAINING - FIXED VERSION")
+    print("CRYPTO RL TRAINING - IMPROVED VERSION")
     print("="*80)
     print(f"Episodes: {episodes}")
-    print(f"Conviction filter: {use_filter}")
-    if use_filter:
-        print(f"Conviction threshold: {args.threshold}")
+    print(f"Reward mode: {args.reward.upper()}")
     print("="*80)
     print()
     
@@ -55,28 +56,26 @@ def main():
         norm = np.load("data/processed/train/norm_train_1h.npy")
         raw = np.load("data/processed/train/raw_train_1h.npy")
     except FileNotFoundError:
-        print("ERROR: Data files not found. Looking in current directory...")
         try:
             norm = np.load("norm_train_1h.npy")
             raw = np.load("raw_train_1h.npy")
         except FileNotFoundError:
             print("ERROR: Could not find training data files!")
-            print("Expected: norm_train_1h.npy and raw_train_1h.npy")
             return
     
     print(f"✅ Loaded {len(norm):,} hourly candles")
-    print(f"   Date range: {len(norm)/24/365.25:.1f} years")
     print()
     
-    # Create environment with FIXED settings
+    # Create environment with IMPROVED settings
     env = CryptoTradingEnvLongShort(
         norm, raw,
         init_balance=10_000,
         fee_pct=0.001,
-        episode_len=500,  # 20.8 days
+        episode_len=500,
         random_start=True,
         lookback=10,
-        drawdown_limit=0.30  # 30% instead of 50%
+        drawdown_limit=0.30,
+        reward_mode=args.reward  # NEW!
     )
     
     state_dim = env.observation_space.shape[0]
@@ -85,11 +84,10 @@ def main():
     print(f"Environment created:")
     print(f"   State dimension: {state_dim}")
     print(f"   Action dimension: {action_dim}")
-    print(f"   Episode length: 500 steps = 20.8 days")
-    print(f"   Drawdown limit: 30%")
+    print(f"   Reward mode: {args.reward}")
     print()
     
-    # Create agent with SMALLER replay buffer
+    # Create agent
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -103,18 +101,16 @@ def main():
         epsilon_min=0.05,
         epsilon_decay=0.995,
         per_alpha=0.6,
-        per_capacity=50_000  # REDUCED from 200k to 50k
+        per_capacity=50_000
     )
     
-    # Logger
+    # IMPROVED Logger
     logger = AdvancedLogger()
     returns = []
     best_mean_50 = -1e9
     breakthrough_episode = None
     
-    # Track statistics
     early_terminations = 0
-    successful_episodes = 0
     
     print()
     print("="*80)
@@ -126,46 +122,25 @@ def main():
         obs = env.reset()
         obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         done = False
-        ep_reward = 0.0
         steps = 0
         
         while not done:
             mask = env._valid_mask()
-            
-            # Action selection with optional conviction filter
-            if use_filter and np.random.rand() > agent.epsilon:
-                with torch.no_grad():
-                    q_vals = agent.policy(obs).cpu().numpy()[0]
-                
-                q_vals[mask == 0] = -np.inf
-                valid_q = q_vals[mask == 1]
-                
-                if len(valid_q) > 1:
-                    best_q = np.max(valid_q)
-                    second_best = np.partition(valid_q, -2)[-2]
-                    
-                    if best_q - second_best < args.threshold:
-                        action = 0  # Force HOLD
-                    else:
-                        action = int(np.argmax(q_vals))
-                else:
-                    action = int(np.argmax(q_vals))
-            else:
-                action = agent.act(obs, mask)
+            action = agent.act(obs, mask)
             
             next_obs, reward, done, info = env.step(action)
+            next_mask = env._valid_mask()
             next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0)
-            
-            agent.remember(obs.cpu().numpy()[0], action, float(reward), 
-                         next_obs.cpu().numpy()[0], float(done))
-            
+
+            agent.remember(obs.cpu().numpy()[0], action, float(reward),
+                         next_obs.cpu().numpy()[0], float(done), next_mask)
+
             obs = next_obs
-            ep_reward += reward
             steps += 1
             
-            # FIXED: Training updates - only 2 per step instead of 4
+            # Training updates
             if epi >= 100 and len(agent.memory) >= 256:
-                for _ in range(2):  # Reduced from 4 to 2
+                for _ in range(2):
                     agent.replay(256)
         
         # Episode complete
@@ -176,8 +151,6 @@ def main():
         # Track early terminations
         if steps < env.episode_len:
             early_terminations += 1
-        else:
-            successful_episodes += 1
         
         # Epsilon decay
         if epi >= 100:
@@ -187,11 +160,10 @@ def main():
         if (epi + 1) % 20 == 0:
             agent.update_target()
         
-        # FIXED: Buffer management - prevent unbounded growth
-        if len(agent.memory) > 45_000:
-            # Don't let it grow beyond capacity, but this shouldn't happen
-            # with proper deque in replay.py
-            pass
+        # IMPROVED: Log episode with step details
+        ep_info = env.get_episode_data()
+        logger.store_episode_summary(ep_info)
+        logger.log_episode_details(epi + 1, ep_info, threshold=0.03)
         
         # Evaluation every 50 episodes
         if (epi + 1) % 50 == 0:
@@ -199,16 +171,24 @@ def main():
             win_rate = np.mean([r > 0 for r in returns[-50:]]) if len(returns) >= 50 else np.mean([r > 0 for r in returns])
             early_rate = early_terminations / 50.0
             
-            logger.logger.info(f"\nEpisode {epi+1}/{episodes}")
+            # Calculate average trades and Sharpe
+            recent_eps = logger.all_episodes[-50:]
+            avg_trades = np.mean([ep.get('total_trades', 0) for ep in recent_eps])
+            avg_sharpe = np.mean([ep.get('sharpe_ratio', 0) for ep in recent_eps])
+            
+            logger.logger.info(f"\n{'='*60}")
+            logger.logger.info(f"Episode {epi+1}/{episodes}")
+            logger.logger.info(f"{'='*60}")
             logger.logger.info(f"  Avg return (last 50): {avg_50:.2%}")
             logger.logger.info(f"  Win rate (last 50): {win_rate:.2%}")
+            logger.logger.info(f"  Avg trades per ep: {avg_trades:.1f}")
+            logger.logger.info(f"  Avg Sharpe: {avg_sharpe:.3f}")
             logger.logger.info(f"  Early termination rate: {early_rate:.1%}")
             logger.logger.info(f"  Epsilon: {agent.epsilon:.3f}")
-            logger.logger.info(f"  Replay buffer: {len(agent.memory):,}")
+            logger.logger.info(f"  Buffer size: {len(agent.memory):,}")
+            logger.logger.info(f"{'='*60}")
             
-            # Reset counters
             early_terminations = 0
-            successful_episodes = 0
         
         # Breakthrough detection
         if (epi + 1) % 10 == 0:
@@ -216,59 +196,112 @@ def main():
             if avg_50 > best_mean_50 * 1.15 and breakthrough_episode is None:
                 best_mean_50 = avg_50
                 breakthrough_episode = epi + 1
-                logger.logger.info(f"\n🎯 Breakthrough @ Episode {breakthrough_episode}")
+                logger.logger.info(f"\n🎯 BREAKTHROUGH @ Episode {breakthrough_episode}")
                 logger.logger.info(f"   50-ep average: {avg_50:.2%}")
-        
-        # FIXED: Log episode details with LOWER threshold (3% instead of 8%)
-        ep_info = env.get_episode_data()
-        ep_info["final_return"] = returns[-1]
-        logger.log_episode_details(epi + 1, ep_info, threshold=0.03)  # Changed from 0.08
+    
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE - Generating Analysis")
+    print("="*80)
     
     # Save model
     final_path = os.path.join(logger.run_dir, f"model_final_{int(time.time())}.pth")
     agent.save(final_path)
     logger.logger.info(f"\n✅ Model saved: {final_path}")
     
-    # Plot results
+    # Generate plots
+    logger.logger.info("Generating training plots...")
     logger.plot_results(returns, [])
+    
+    # IMPROVED: Analyze best and worst episodes
+    logger.logger.info("Analyzing top performing episodes...")
+    returns_array = np.array(returns)
+    best_indices = np.argsort(returns_array)[-args.analyze_best:][::-1]
+    worst_indices = np.argsort(returns_array)[:args.analyze_best]
+    
+    compare_episodes = list(best_indices + 1) + list(worst_indices + 1)
+    logger.plot_episode_comparison(compare_episodes)
+    
+    # Generate final report
+    logger.generate_final_report(returns)
     
     # Summary
     summary = {
         "episodes": episodes,
+        "reward_mode": args.reward,
         "avg_return_all": float(np.mean(returns)),
         "avg_return_last_50": float(np.mean(returns[-50:])),
         "avg_return_last_100": float(np.mean(returns[-100:])) if len(returns) >= 100 else float(np.mean(returns)),
         "best_return": float(np.max(returns)),
         "worst_return": float(np.min(returns)),
         "win_rate": float(np.mean([r > 0 for r in returns])),
+        "sharpe_ratio": float(np.mean(returns) / (np.std(returns) + 1e-8)),
         "breakthrough_episode": breakthrough_episode,
         "final_epsilon": float(agent.epsilon),
-        "conviction_filter": use_filter,
-        "conviction_threshold": args.threshold if use_filter else None,
         "model_path": final_path,
-        "final_buffer_size": len(agent.memory),
+        "avg_trades_per_episode": float(np.mean([ep.get('total_trades', 0) for ep in logger.all_episodes])),
+        "avg_sharpe_per_episode": float(np.mean([ep.get('sharpe_ratio', 0) for ep in logger.all_episodes])),
     }
     
     with open(os.path.join(logger.run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     
     print("\n" + "="*80)
-    print("TRAINING COMPLETE")
+    print("TRAINING SUMMARY")
     print("="*80)
     for k, v in summary.items():
-        print(f"  {k}: {v}")
+        if isinstance(v, float):
+            if 'return' in k or 'rate' in k:
+                print(f"  {k}: {v*100:.3f}%" if abs(v) < 1 else f"  {k}: {v:.3f}")
+            else:
+                print(f"  {k}: {v:.3f}")
+        else:
+            print(f"  {k}: {v}")
     print("="*80)
     
-    # Print some notable episodes
+    # Print detailed analysis
+    print("\n" + "="*80)
+    print("DETAILED ANALYSIS")
+    print("="*80)
+    
     print("\nTop 5 Episodes:")
     top_indices = np.argsort(returns)[-5:][::-1]
-    for idx in top_indices:
-        print(f"  Episode {idx+1}: {returns[idx]:.2%}")
+    for rank, idx in enumerate(top_indices, 1):
+        ep_data = logger.all_episodes[idx]
+        print(f"  {rank}. Episode {idx+1}: {returns[idx]:.2%} return")
+        print(f"     Trades: {ep_data.get('total_trades', 0)} | " +
+              f"Win Rate: {ep_data.get('positive_trades', 0)/max(ep_data.get('total_trades', 1), 1)*100:.1f}% | " +
+              f"Sharpe: {ep_data.get('sharpe_ratio', 0):.3f}")
     
-    print("\nBottom 5 Episodes:")
+    print("\nWorst 5 Episodes:")
     bottom_indices = np.argsort(returns)[:5]
-    for idx in bottom_indices:
-        print(f"  Episode {idx+1}: {returns[idx]:.2%}")
+    for rank, idx in enumerate(bottom_indices, 1):
+        ep_data = logger.all_episodes[idx]
+        print(f"  {rank}. Episode {idx+1}: {returns[idx]:.2%} return")
+        print(f"     Trades: {ep_data.get('total_trades', 0)} | " +
+              f"Max DD: {ep_data.get('max_drawdown', 0)*100:.1f}% | " +
+              f"Sharpe: {ep_data.get('sharpe_ratio', 0):.3f}")
+    
+    # Trading behavior analysis
+    print("\n" + "="*80)
+    print("TRADING BEHAVIOR ANALYSIS")
+    print("="*80)
+    all_trades = [ep.get('total_trades', 0) for ep in logger.all_episodes]
+    print(f"Average trades per episode: {np.mean(all_trades):.1f}")
+    print(f"Min trades: {np.min(all_trades)}")
+    print(f"Max trades: {np.max(all_trades)}")
+    print(f"Median trades: {np.median(all_trades):.1f}")
+    
+    # Check for "coasting" behavior (episodes with 1-3 trades)
+    coasting_episodes = [i for i, t in enumerate(all_trades) if 1 <= t <= 3]
+    if coasting_episodes:
+        coasting_returns = [returns[i] for i in coasting_episodes]
+        print(f"\nEpisodes with 1-3 trades (potential coasting): {len(coasting_episodes)} ({len(coasting_episodes)/len(all_trades)*100:.1f}%)")
+        print(f"  Avg return from coasting episodes: {np.mean(coasting_returns):.2%}")
+        print(f"  Win rate from coasting episodes: {np.mean([r > 0 for r in coasting_returns])*100:.1f}%")
+    
+    print("\n" + "="*80)
+    print(f"Full analysis available in: {logger.run_dir}")
+    print("="*80)
 
 if __name__ == "__main__":
     main()
